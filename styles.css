@@ -474,6 +474,31 @@ option {
   opacity: .9;
 }
 
+.backup-status-row {
+  margin-top: 14px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.backup-now {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+}
+
+.backup-status {
+  font-size: .75rem;
+  color: var(--text-muted);
+  line-height: 1.35;
+}
+
+.backup-status.error {
+  color: var(--danger-text);
+}
+
 /* ============ TOAST ============ */
 .toast {
   position: fixed;

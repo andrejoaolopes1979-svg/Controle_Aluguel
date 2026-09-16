@@ -6,6 +6,11 @@
 const PALETTE = ['#f97316', '#fb923c', '#f59e0b', '#fbbf24', '#fdba74', '#ea580c', '#d97706', '#c2410c', '#fde68a', '#fca5a5'];
 const LS_PAYMENTS = 'aluguel_payments';
 const LS_HISTORY = 'aluguel_history';
+const LS_SAVED_AT = 'aluguel_saved_at';
+const IDB_NAME = 'controle-aluguel-db';
+const IDB_STORE = 'profile';
+const IDB_RECORD = 'main';
+const IDB_RETRY_MS = 30000;
 
 const $ = (id) => document.getElementById(id);
 const moneyFmt = new Intl.NumberFormat('pt-BR', { style: 'currency', currency: 'BRL' });
@@ -15,13 +20,22 @@ let payments = [];
 let chart = null;
 let filters = { search: '', tipo: '', periodo: 0 };
 
+let historyState = { entries: [] };
+let dbPromise = null;
+let idbQueue = Promise.resolve();
+let idbAvailable = true;
+let idbRetryTimer = null;
+let lastBackupAt = null;
+
 /* ---------------- Inicialização ---------------- */
 function init() {
   if (window.ChartDataLabels) Chart.register(ChartDataLabels);
   bindEvents();
   $('data').value = todayStr();
-  loadLocal();
-  renderAll();
+  loadData().then(() => {
+    renderAll();
+    updateBackupIndicator();
+  });
 
   if ('serviceWorker' in navigator) {
     window.addEventListener('load', () => {
@@ -61,6 +75,7 @@ function bindEvents() {
 
   $('export-btn').addEventListener('click', exportData);
   $('import-file').addEventListener('change', importData);
+  $('backup-now-btn').addEventListener('click', saveBackupNow);
 
   if ('serviceWorker' in navigator) {
     window.addEventListener('beforeinstallprompt', (e) => {
@@ -72,28 +87,227 @@ function bindEvents() {
   }
 }
 
-/* ---------------- Dados (localStorage) ---------------- */
-function loadLocal() {
-  payments = [];
+/* ------- Persistência durável (localStorage + IndexedDB) ------- */
+function readLocalSnapshot() {
+  const snap = { payments: null, history: null, savedAt: null };
   try {
     const raw = JSON.parse(localStorage.getItem(LS_PAYMENTS));
-    if (Array.isArray(raw)) {
-      payments = raw.map((p) => ({
-        id: String(p.id || genId()),
-        tipo: p.tipo || '',
-        unidade: p.unidade || '',
-        valor: Number(p.valor) || 0,
-        data: p.data || '',
-        pagamento: p.pagamento || '',
-        banco: p.banco || ''
-      }));
-    }
+    if (Array.isArray(raw)) snap.payments = raw;
   } catch { /* ignora */ }
-  sortPayments();
+  try {
+    const h = JSON.parse(localStorage.getItem(LS_HISTORY));
+    if (h && Array.isArray(h.entries)) snap.history = h;
+  } catch { /* ignora */ }
+  const t = Number(localStorage.getItem(LS_SAVED_AT));
+  snap.savedAt = Number.isFinite(t) && t > 0 ? t : null;
+  return snap;
 }
 
-function saveLocal() {
-  localStorage.setItem(LS_PAYMENTS, JSON.stringify(payments));
+function normalizePayment(p) {
+  return {
+    id: String((p && p.id) || genId()),
+    tipo: (p && p.tipo) || '',
+    unidade: (p && p.unidade) || '',
+    valor: Number((p && p.valor) || 0) || 0,
+    data: (p && p.data) || '',
+    pagamento: (p && p.pagamento) || '',
+    banco: (p && p.banco) || ''
+  };
+}
+
+function normalizeHistory(h) {
+  return h && Array.isArray(h.entries) ? { entries: h.entries.slice(0, 60) } : { entries: [] };
+}
+
+function hasData(snap) {
+  return !!(snap.savedAt != null ||
+    (snap.payments && snap.payments.length) ||
+    (snap.history && snap.history.entries && snap.history.entries.length));
+}
+
+function reconcile(local, idb) {
+  const idbSnap = idb || { payments: null, history: null, savedAt: null };
+  const localT = local.savedAt || 0;
+  const idbT = idbSnap.savedAt || 0;
+  const localHas = hasData(local);
+  const idbHas = hasData(idbSnap);
+
+  let source;
+  if (!localHas && !idbHas) source = 'none';
+  else if (localHas && !idbHas) source = 'local';
+  else if (idbHas && !localHas) source = 'idb';
+  else source = idbT > localT ? 'idb' : 'local';
+
+  const data = source === 'idb' ? idbSnap : local;
+  return {
+    source,
+    payments: (Array.isArray(data.payments) ? data.payments : []).map(normalizePayment),
+    history: normalizeHistory(data.history),
+    savedAt: data.savedAt || 0
+  };
+}
+
+function decideSync(result, idb) {
+  if (result.source === 'none') return 'none';
+  if (result.source === 'idb') return 'local';
+  if (!idb || (idb.savedAt || 0) < result.savedAt) return 'idb';
+  return 'none';
+}
+
+function writeLocalSnapshot(pays, hist, savedAt) {
+  try {
+    localStorage.setItem(LS_PAYMENTS, JSON.stringify(pays));
+    localStorage.setItem(LS_HISTORY, JSON.stringify(hist));
+    localStorage.setItem(LS_SAVED_AT, String(savedAt));
+  } catch { /* quota/armazenamento indisponível */ }
+}
+
+function makeRecord(pays, hist, savedAt) {
+  return { id: IDB_RECORD, payments: pays, history: hist, savedAt };
+}
+
+function idbOpen() {
+  if (dbPromise) return dbPromise;
+  if (!('indexedDB' in window)) {
+    dbPromise = Promise.reject(new Error('indexedDB indisponível'));
+    dbPromise.catch(() => { dbPromise = null; });
+    return dbPromise;
+  }
+  dbPromise = new Promise((resolve, reject) => {
+    const req = indexedDB.open(IDB_NAME, 1);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains(IDB_STORE)) {
+        db.createObjectStore(IDB_STORE, { keyPath: 'id' });
+      }
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error || new Error('idb-open'));
+    req.onblocked = () => reject(new Error('idb-blocked'));
+  });
+  dbPromise.catch(() => { dbPromise = null; });
+  return dbPromise;
+}
+
+function idbPut(db, record) {
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(IDB_STORE, 'readwrite');
+    tx.objectStore(IDB_STORE).put(record);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error || new Error('idb-put'));
+    tx.onabort = () => reject(tx.error || new Error('idb-abort'));
+  });
+}
+
+function idbGet(db) {
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(IDB_STORE, 'readonly');
+    const req = tx.objectStore(IDB_STORE).get(IDB_RECORD);
+    req.onsuccess = () => resolve(req.result || null);
+    req.onerror = () => reject(req.error || new Error('idb-get'));
+  });
+}
+
+function idbRead() {
+  if (!('indexedDB' in window)) return Promise.resolve(null);
+  return idbOpen().then((db) => idbGet(db)).catch(() => {
+    dbPromise = null;
+    idbAvailable = false;
+    scheduleIdbRetry();
+    return null;
+  });
+}
+
+function enqueueIdbWrite(record) {
+  idbAvailable = true;
+  idbQueue = idbQueue
+    .then(() => idbOpen())
+    .then((db) => idbPut(db, record))
+    .then(() => {
+      lastBackupAt = record.savedAt;
+      clearTimeout(idbRetryTimer);
+      idbRetryTimer = null;
+      updateBackupIndicator();
+      return true;
+    })
+    .catch(() => {
+      dbPromise = null;
+      idbAvailable = false;
+      scheduleIdbRetry();
+      updateBackupIndicator();
+      return false;
+    });
+  return idbQueue;
+}
+
+function mirrorBackup() {
+  if (!idbAvailable) return;
+  enqueueIdbWrite(makeRecord(payments, historyState, Date.now()));
+}
+
+function scheduleIdbRetry() {
+  if (idbRetryTimer) return;
+  idbRetryTimer = setTimeout(() => {
+    idbRetryTimer = null;
+    idbAvailable = true;
+    if (payments.length || historyState.entries.length) {
+      enqueueIdbWrite(makeRecord(payments, historyState, Date.now()));
+    } else {
+      updateBackupIndicator();
+    }
+  }, IDB_RETRY_MS);
+}
+
+function persistData() {
+  const savedAt = Date.now();
+  writeLocalSnapshot(payments, historyState, savedAt);
+  mirrorBackup();
+}
+
+function loadData() {
+  const local = readLocalSnapshot();
+  return idbRead().then((idb) => {
+    const result = reconcile(local, idb);
+    payments = result.payments;
+    historyState = result.history;
+    sortPayments();
+
+    const syncTarget = decideSync(result, idb);
+    if (syncTarget === 'local') {
+      writeLocalSnapshot(result.payments, result.history, result.savedAt || Date.now());
+    } else if (syncTarget === 'idb') {
+      const fresh = result.savedAt || Date.now();
+      if (!result.savedAt) writeLocalSnapshot(result.payments, result.history, fresh);
+      enqueueIdbWrite(makeRecord(result.payments, result.history, fresh));
+    }
+
+    lastBackupAt = result.savedAt || (syncTarget === 'none' ? null : Date.now());
+    updateBackupIndicator();
+  });
+}
+
+function updateBackupIndicator() {
+  const el = $('backup-status');
+  if (!el) return;
+  if (!idbAvailable) {
+    el.textContent = 'Backup automático indisponível — dados salvos apenas neste dispositivo';
+    el.classList.add('error');
+    return;
+  }
+  el.classList.remove('error');
+  el.textContent = 'Backup automático ativo · última sincronização ' + fmtDateTime(lastBackupAt);
+}
+
+function saveBackupNow() {
+  if (!payments.length && !historyState.entries.length) {
+    showToast('Nada para salvar — adicione um pagamento primeiro.', true);
+    return;
+  }
+  const savedAt = Date.now();
+  writeLocalSnapshot(payments, historyState, savedAt);
+  enqueueIdbWrite(makeRecord(payments, historyState, savedAt)).then((ok) => {
+    showToast(ok ? 'Backup salvo agora!' : 'Não foi possível salvar o backup agora.', !ok);
+  });
 }
 
 function sortPayments() {
@@ -120,8 +334,8 @@ function savePayment(e) {
 
   payments.push({ id: genId(), tipo, unidade, valor, data, pagamento, banco });
   sortPayments();
-  saveLocal();
   addEntry({ tipo, unidade, pagamento, banco });
+  persistData();
   clearForm();
   renderAll();
   showToast('Pagamento salvo!');
@@ -130,7 +344,7 @@ function savePayment(e) {
 function deletePayment(id, tipo) {
   if (!confirm('Excluir este pagamento de ' + tipo + '?')) return;
   payments = payments.filter((p) => p.id !== id);
-  saveLocal();
+  persistData();
   renderAll();
   showToast('Pagamento excluído.');
 }
@@ -198,7 +412,7 @@ function importData(event) {
         banco: String(it.banco || '')
       }));
       sortPayments();
-      saveLocal();
+      persistData();
       renderAll();
       showToast('Dados importados com sucesso!');
     } catch (err) {
@@ -401,20 +615,16 @@ function fillDatalist(el, values) {
 
 /* ---------------- Memória / autocomplete ---------------- */
 function readHistory() {
-  try {
-    const h = JSON.parse(localStorage.getItem(LS_HISTORY));
-    if (h && Array.isArray(h.entries)) return h;
-  } catch { /* ignora */ }
-  return { entries: [] };
+  return historyState;
 }
 
 function addEntry(entry) {
-  const h = readHistory();
-  h.entries = [
-    entry,
-    ...h.entries.filter((e) => e.unidade !== entry.unidade || e.tipo !== entry.tipo)
-  ].slice(0, 60);
-  localStorage.setItem(LS_HISTORY, JSON.stringify(h));
+  historyState = {
+    entries: [
+      entry,
+      ...historyState.entries.filter((e) => e.unidade !== entry.unidade || e.tipo !== entry.tipo)
+    ].slice(0, 60)
+  };
 }
 
 function unidadeMap() {
@@ -464,6 +674,13 @@ function fmtDate(iso) {
   return `${d}/${m}/${y}`;
 }
 
+function fmtDateTime(ts) {
+  if (!ts) return '—';
+  return new Date(ts).toLocaleString('pt-BR', {
+    day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit'
+  });
+}
+
 function uniq(arr) {
   return [...new Set(arr.filter(Boolean))];
 }
@@ -487,6 +704,23 @@ function showToast(text, isError) {
 }
 
 /* ---------------- Bootstrap ---------------- */
-document.addEventListener('DOMContentLoaded', () => {
-  init();
-});
+if (typeof document !== 'undefined') {
+  document.addEventListener('DOMContentLoaded', () => {
+    init();
+  });
+}
+
+if (typeof module !== 'undefined' && module.exports) {
+  module.exports = {
+    reconcile,
+    decideSync,
+    hasData,
+    normalizePayment,
+    normalizeHistory,
+    readLocalSnapshot,
+    LS_PAYMENTS,
+    LS_HISTORY,
+    LS_SAVED_AT,
+    IDB_RECORD
+  };
+}
