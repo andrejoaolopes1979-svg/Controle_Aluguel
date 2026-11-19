@@ -2,6 +2,10 @@
 
 App para celular (SPA + PWA) em HTML/CSS/JS para controle de aluguéis. Funciona 100% offline, sem servidor, com autenticação e dados salvos em armazenamento local do dispositivo (`localStorage` + backup durável em `IndexedDB`).
 
+## Acesso
+
+Acesse o app pelo GitHub Pages: [https://andrejoaolopes1979-svg.github.io/Controle_Aluguel/](https://andrejoaolopes1979-svg.github.io/Controle_Aluguel/)
+
 ## Funcionalidades
 
 - **Cadastro de pagamentos**: tipo do imóvel, unidade consumidora, valor recebido, data, tipo de pagamento e banco
@@ -35,7 +39,7 @@ icons/                 Ícones do app
 ## Observações
 
 - Os dados ficam em dois lugares do navegador: `localStorage` (principal, chaves `aluguel_payments`, `aluguel_history`, `aluguel_saved_at`) e um espelho durável em `IndexedDB` (banco `controle-aluguel-db`, store `profile`, registro `main`).
-- A cada gravação os dados são espelhados em `IndexedDB` silenciosamente (fila de Promises para evitar escritas concorrentes). Na inicialização, as duas fontes são reconciliadas pelo timestamp `savedAt` e a mais recente vence, sincronizando a outra — assim, limpar o cache do navegador (ou os dados de sites) não perde nada, pois a fonte restante restaura tudo.
+- A cada gravação os dados são espelhados em `IndexedDB` silenciosamente (fila de Promises para evitar escritas concorrentes). Na inicialização, as duas fontes são reconciliadas pelo timestamp `savedAt` e a mais recente vence, sincronizando a outra.
 - Se o `IndexedDB` estiver indisponível (modo anônimo/privado, quota), o app segue funcionando só com `localStorage` e o indicador mostra "Backup automático indisponível".
 - Use o botão **Salvar agora** na seção "Backup de dados" para forçar a sincronização manual das duas fontes, com confirmação via toast.
 - Para transferir dados entre dispositivos ou manter um backup externo, use **Exportar JSON** na seção "Backup de dados" e depois **Importar JSON** no outro aparelho.
